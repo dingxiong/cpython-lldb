@@ -17,7 +17,7 @@ ENCODING_RE = re.compile(r'^[ \t\f]*#.*?coding[:=][ \t]*([-_.a-zA-Z0-9]+)')
 # Objects
 
 class PyObject(object):
-    def __init__(self, lldb_value):
+    def __init__(self, lldb_value: lldb.SBValue):
         self.lldb_value = lldb_value
 
     def __repr__(self):
@@ -379,6 +379,76 @@ class _PyDictObject(object):
 
         return rv
 
+def get_dict(value: lldb.SBValue, internal_dict):
+    x = lldb.frame.FindVariable('v')
+    d = x.addr.GetLoadAddress(lldb.debugger.GetSelectedTarget())
+    d -= 32
+    y = lldb.debugger.GetSelectedTarget().ResolveLoadAddress(d)
+
+
+    ma_keys = lldb.frame.EvaluateExpression('((PyHeapTypeObject*)v->ob_type)->ht_cached_keys')
+    ma_values = lldb.frame.EvaluateExpression('*(((PyDictValues **)v)-4)')
+    table_size = ma_keys.GetChildMemberWithName('dk_size').unsigned
+    num_entries = ma_keys.GetChildMemberWithName('dk_nentries').unsigned
+
+    target = value.GetTarget()
+    byte_type = target.FindFirstType('char')
+    dict_type = target.FindFirstType('PyDictObject')
+    dictentry_type = target.FindFirstType('PyDictKeyEntry')
+    object_type = target.FindFirstType('PyObject')
+
+    # hash table effectively stores indexes of entries in the key/value
+    # pairs array; the size of an index varies, so that all possible
+    # array positions can be addressed
+    if table_size < 0xff:
+        index_size = 1
+    elif table_size < 0xffff:
+        index_size = 2
+    elif table_size < 0xfffffff:
+        index_size = 4
+    else:
+        index_size = 8
+    shift = table_size * index_size
+
+    indices = ma_keys.GetChildMemberWithName("dk_indices")
+    if indices.IsValid():
+        # CPython version >= 3.6
+        # entries are stored in an array right after the indexes table
+        entries = indices.Cast(byte_type.GetArrayType(shift)) \
+                         .GetChildAtIndex(shift, 0, True) \
+                         .AddressOf() \
+                         .Cast(dictentry_type.GetPointerType()) \
+                         .deref \
+                         .Cast(dictentry_type.GetArrayType(num_entries))
+    else:
+        # CPython version < 3.6
+        num_entries = table_size
+        entries = ma_keys.GetChildMemberWithName("dk_entries") \
+                         .Cast(dictentry_type.GetArrayType(num_entries))
+
+    if ma_values.unsigned:
+        is_split = True
+        ma_values = ma_values.deref.Cast(object_type.GetPointerType().GetArrayType(num_entries))
+    else:
+        is_split = False
+
+    rv = {}
+    for i in range(num_entries):
+        entry = entries.GetChildAtIndex(i)
+        k = entry.GetChildMemberWithName('me_key')
+        v = entry.GetChildMemberWithName('me_value')
+        if k.unsigned != 0 and v.unsigned != 0:
+            # hash table is "combined"; keys and values are stored together
+            rv[PyObject.from_value(k)] = PyObject.from_value(v)
+        elif k.unsigned != 0 and is_split:
+            # hash table is "split"; values are stored separately
+            for j in range(i, table_size):
+                v = ma_values.GetChildAtIndex(j)
+                if v.unsigned != 0:
+                    rv[PyObject.from_value(k)] = PyObject.from_value(v)
+                    break
+
+    return rv
 
 class PyDictObject(_PyDictObject, PyObject):
 
@@ -1089,7 +1159,7 @@ def general_purpose_registers(frame):
         return []
 
 
-def register_commands(debugger):
+def register_commands(debugger: lldb.SBDebugger):
     for cls in Command.__subclasses__():
         debugger.HandleCommand(
             'command script add -c cpython_lldb.{cls} {command}'.format(
@@ -1097,6 +1167,8 @@ def register_commands(debugger):
                 command=cls.command,
             )
         )
+
+    debugger.HandleCommand("command script add -f cpython_lldb.get_dict  p_dict")
 
 
 def pretty_printer(value, internal_dict):
